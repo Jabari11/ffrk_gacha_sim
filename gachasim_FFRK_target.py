@@ -1,32 +1,6 @@
-import random
 from collections import Counter
 
-def simulate_one_pull(rates, guarantee_rank, bits_per_pull=11):
-    """
-    Simulate one pull = `bits_per_pull` bit results.
-    The last bit is guaranteed to be >= guarantee_rank if none of the earlier
-    bits in this pull reached that rank.
-    """
-    ranks = list(rates.keys())
-    probabilities = list(rates.values())
-
-    results = []
-
-    # First bits_per_pull - 1 bits
-    for _ in range(bits_per_pull - 1):
-        results.append(random.choices(ranks, probabilities)[0])
-
-    # Final guaranteed bit
-    if all(rank < guarantee_rank for rank in results):
-        guarantee_space = {k: v for k, v in rates.items() if k >= guarantee_rank}
-        guarantee_ranks = list(guarantee_space.keys())
-        guarantee_total = sum(guarantee_space.values())
-        guarantee_probs = [guarantee_space[k] / guarantee_total for k in guarantee_ranks]
-        results.append(random.choices(guarantee_ranks, guarantee_probs)[0])
-    else:
-        results.append(random.choices(ranks, probabilities)[0])
-
-    return results
+from gacha_pull_utils import validate_rates, simulate_one_pull_multi_guarantee
 
 
 def pity_tokens_earned(pity_rules, start_pull_count, total_pull_count):
@@ -94,6 +68,7 @@ def simulate_one_run(
     start_pull_count=0,
     seed_seen_targets=None,
     bits_per_pull=11,
+    guarantees_per_pull=1,
 ):
     """
     Simulate the remaining pulls of a single in-progress run.
@@ -111,10 +86,11 @@ def simulate_one_run(
     newly_seen_targets = set()
 
     for _ in range(pulls_to_simulate):
-        pull_results = simulate_one_pull(
+        pull_results = simulate_one_pull_multi_guarantee(
             rates=rates,
             guarantee_rank=guarantee_rank,
-            bits_per_pull=bits_per_pull
+            guarantees_per_pull=guarantees_per_pull,
+            bits_per_pull=bits_per_pull,
         )
         run_bit_results.update(pull_results)
 
@@ -155,6 +131,7 @@ def simulate_many_runs(
     start_pull_count=0,
     seed_seen_targets=None,
     bits_per_pull=11,
+    guarantees_per_pull=1,
 ):
     """
     Estimate success probability for a run with prior progress.
@@ -164,8 +141,7 @@ def simulate_many_runs(
     start_pull_count:
       pulls already spent in the current real run
     """
-    if abs(sum(rates.values()) - 1.0) > 1e-9:
-        raise ValueError(f"Rates must sum to 1.0, got {sum(rates.values())}")
+    validate_rates(rates)
 
     if total_run_pulls < start_pull_count:
         raise ValueError("total_run_pulls must be >= start_pull_count")
@@ -175,7 +151,6 @@ def simulate_many_runs(
     overall_bit_results = Counter()
     successes = 0
 
-    # New metrics
     target_bits_total = 0
     non_trash_bits_total = 0
 
@@ -189,11 +164,11 @@ def simulate_many_runs(
             start_pull_count=start_pull_count,
             seed_seen_targets=seed_seen_targets,
             bits_per_pull=bits_per_pull,
+            guarantees_per_pull=guarantees_per_pull,
         )
 
         overall_bit_results.update(result["bit_results"])
 
-        # Count target bits and non-trash bits from this run
         run_bit_results = result["bit_results"]
         target_bits_total += sum(run_bit_results[r] for r in target_ranks)
         non_trash_bits_total += sum(count for rank, count in run_bit_results.items() if rank >= guarantee_rank)
@@ -221,7 +196,9 @@ def simulate_many_runs(
         f"Simulation: {iterations} runs, "
         f"total_run_pulls={total_run_pulls}, "
         f"start_pull_count={start_pull_count}, "
-        f"remaining_pulls={pulls_to_simulate}"
+        f"remaining_pulls={pulls_to_simulate}, "
+        f"guarantees_per_pull={guarantees_per_pull}, "
+        f"guarantee_rank={guarantee_rank}"
     )
     print("Average probability per bit (empirical):")
     for rank, avg in sorted(average_results.items(), reverse=True):
@@ -237,6 +214,7 @@ def simulate_many_runs(
         "avg_non_trash_bits_per_pull": avg_non_trash_bits_per_pull,
         "success_rate": success_rate,
     }
+
 
 # ============================================================
 # USER-EDITABLE SECTION
@@ -267,24 +245,13 @@ def simulate_many_runs(
 # - The simulator will stop with an error if they do not
 # - Usually "0" is trash / unwanted junk
 # - Higher numbers here are just IDs / tiers used by the sim
-#
-# Example:
-#   20 and 19 are my chase relics at 1% each
-#   18 and 17 might be other good relics
-#   16 might be "non-trash but not target"
-#   0 is trash
-#
-# In this example banner:
-# - 20, 19, 18, 17 are targetable/good outcomes
-# - 16 is non-trash filler
-# - 0 is trash
 rates = {
     20: 0.01,
     19: 0.01,
     18: 0.01,
     17: 0.01,
     16: 0.1004,
-    0: 1 - 0.1404,   # 3 and 4-star trash
+    0: 1 - 0.1404,
 }
 
 
@@ -305,13 +272,6 @@ rates = {
 # - Pity does NOT affect the pulls during the run
 # - If you can choose only one relic from a pity reward, list one rule
 # - If there are multiple pity rewards, list multiple rules
-#
-# Example below means:
-# - after 5 pulls, you may pick either 17 or 18
-# - after 10 pulls, you may pick any of 17/18/19/20
-#
-# If a banner has NO pity, use:
-#   pity_rules = []
 pity_rules = [
     {"after_pulls": 5, "allow": {17, 18}},
     {"after_pulls": 10, "allow": {17, 18, 19, 20}},
@@ -321,72 +281,50 @@ pity_rules = [
 # ------------------------------------------------------------
 # RUN SETTINGS
 # ------------------------------------------------------------
-# These values describe the specific run you want to simulate.
-#
 # total_run_pulls
 #   Total pull budget for the full run.
-#   Example:
-#   - If you want odds of success within 10 total pulls, use 10
 #
 # iterations
 #   Number of simulated runs to test.
 #   More iterations = more accurate, but slower.
-#   Good defaults:
-#   - 10,000   = quick estimate
-#   - 100,000  = good accuracy
-#   - 500,000+ = very stable, but slower
 #
 # guarantee_rank
-#   The minimum rank/tier that counts as "guaranteed non-trash" on the last bit.
-#   The simulator checks the first 10 bits of each pull:
-#   - if none reach this rank, the 11th bit is forced to be this rank or better
+#   Minimum rank/tier that counts as guaranteed non-trash.
 #
-#   Example:
-#   - if trash is 0 and all real relics are 1 or higher, use guarantee_rank=1
-#   - if only 15+ counts as "guaranteed", use guarantee_rank=15
+# guarantees_per_pull
+#   Number of guaranteed rank-or-better bits per pull.
+#   For the classic old sim behavior, leave this as 1.
 #
 # target_ranks
 #   The specific IDs you are trying to collect for success.
-#   A run succeeds only if all missing targets can be covered by:
-#   - natural pulls during the run, plus
-#   - any pity selections earned
 #
 # bits_per_pull
 #   Number of bits/items in each pull.
-#   Usually 11 for FFRK-style banners.
 #
 # start_pull_count
 #   How many pulls you have ALREADY spent on this same run before resuming.
 #
-#   Example:
-#   - starting fresh: 0
-#   - already did 2 pulls on this banner run: 2
-#
 # seed_seen_targets
 #   Which target IDs you have ALREADY hit earlier in this same run.
-#
-#   Example:
-#   - if target_ranks = {20, 19, 18, 17}
-#   - and your first 2 pulls already got 20 and 18
-#   - then use seed_seen_targets = {20, 18}
-#
-#   If starting fresh, use:
-#   - set()
-#
-# EXAMPLE BELOW:
-# - Full run budget is 10 pulls
-# - I already spent 2 pulls on this run
-# - I want to know my odds from here to finish by pull 10
-# - My success targets are all of 20, 19, 18, and 17
-# - I have not hit any of them yet
+total_run_pulls = 5
+iterations = 100000
+guarantee_rank = 1
+guarantees_per_pull = 1
+target_ranks = {20, 19, 18, 17}
+bits_per_pull = 11
+start_pull_count = 0
+seed_seen_targets = set()
+
+
 simulate_many_runs(
-    total_run_pulls=10,
-    iterations=100000,
+    total_run_pulls=total_run_pulls,
+    iterations=iterations,
     rates=rates,
-    guarantee_rank=1,
-    target_ranks={20, 19, 18, 17},
+    guarantee_rank=guarantee_rank,
+    target_ranks=target_ranks,
     pity_rules=pity_rules,
-    start_pull_count=2,
-    seed_seen_targets=set(),
-    bits_per_pull=11,
+    start_pull_count=start_pull_count,
+    seed_seen_targets=seed_seen_targets,
+    bits_per_pull=bits_per_pull,
+    guarantees_per_pull=guarantees_per_pull,
 )
